@@ -3,24 +3,29 @@ name: nOps image build
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
-  group: nops-build-images-${{ github.sha }}
-  cancel-in-progress: false
+  group: nops-build-images-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   AWS_REGION: us-west-2
+  PUBLISH: ${{ github.event_name != 'pull_request' }}
 
 jobs:
   build:
     if: github.repository == 'nops-io/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -34,12 +39,14 @@ jobs:
           persist-credentials: false
 
       - uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        if: env.PUBLISH == 'true'
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve registry
         id: registry
+        if: env.PUBLISH == 'true'
         run: |
           account="$(aws sts get-caller-identity --query Account --output text)"
           registry="${account}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -53,20 +60,22 @@ jobs:
       - name: Build
         if: steps.registry.outputs.exists != 'true'
         env:
-          IMAGE: ${{ steps.registry.outputs.image }}
+          IMAGE: ${{ steps.registry.outputs.image || format('{0}:{1}', env.REPOSITORY, env.TAG) }}
           COMPONENT: ${{ matrix.component }}
         run: |
           docker build --platform linux/amd64 \
             --build-arg LITELLM_RELEASE_TAG="$TAG" \
             -f "${COMPONENT}/Dockerfile" -t "$IMAGE" .
+          docker image ls "$IMAGE"
 
       - name: Push
-        if: steps.registry.outputs.exists != 'true'
+        if: env.PUBLISH == 'true' && steps.registry.outputs.exists != 'true'
         env:
           IMAGE: ${{ steps.registry.outputs.image }}
         run: docker push "$IMAGE"
 
       - name: Summary
+        if: env.PUBLISH == 'true'
         env:
           IMAGE: ${{ steps.registry.outputs.image }}
         run: echo "\`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
