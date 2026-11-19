@@ -3105,6 +3105,132 @@ def test_convert_to_anthropic_tool_result_mixed_content_with_cache_control():
     assert result["content"][3].get("cache_control") is None
 
 
+_EPHEMERAL: Final = {"type": "ephemeral"}
+
+
+def _tool_message(content: object, **extra: object) -> dict[str, object]:
+    return {"role": "tool", "tool_call_id": "toolu_empty_stdout", "content": content, **extra}
+
+
+def test_cursor_empty_tool_output_with_cache_control_becomes_a_cached_placeholder():
+    """Cursor sends an empty text block with cache_control for a command with no stdout.
+    Vertex answered: "tool_result.content.0.text: cache_control cannot be set for empty text blocks"."""
+    from litellm.litellm_core_utils.prompt_templates.factory import convert_to_anthropic_tool_result
+
+    result = convert_to_anthropic_tool_result(
+        _tool_message([{"type": "text", "text": "", "cache_control": _EPHEMERAL}])
+    )
+
+    assert result == {
+        "type": "tool_result",
+        "tool_use_id": "toolu_empty_stdout",
+        "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER, "cache_control": _EPHEMERAL}],
+    }
+
+
+def test_blank_tool_result_text_block_is_dropped_and_its_cache_control_moves_to_the_last_kept_block():
+    from litellm.litellm_core_utils.prompt_templates.factory import convert_to_anthropic_tool_result
+
+    result = convert_to_anthropic_tool_result(
+        _tool_message(
+            [
+                {"type": "text", "text": "exit code 0"},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": " \n", "cache_control": _EPHEMERAL},
+            ]
+        )
+    )
+
+    assert result == {
+        "type": "tool_result",
+        "tool_use_id": "toolu_empty_stdout",
+        "content": [{"type": "text", "text": "exit code 0", "cache_control": _EPHEMERAL}],
+    }
+
+
+def test_dropped_cache_control_goes_on_the_tool_result_when_the_last_kept_block_already_has_one():
+    from litellm.litellm_core_utils.prompt_templates.factory import convert_to_anthropic_tool_result
+
+    five_minutes: Final = {"type": "ephemeral", "ttl": "5m"}
+    result = convert_to_anthropic_tool_result(
+        _tool_message(
+            [
+                {"type": "text", "text": "exit code 0", "cache_control": five_minutes},
+                {"type": "text", "text": "", "cache_control": _EPHEMERAL},
+            ]
+        )
+    )
+
+    assert result == {
+        "type": "tool_result",
+        "tool_use_id": "toolu_empty_stdout",
+        "content": [{"type": "text", "text": "exit code 0", "cache_control": five_minutes}],
+        "cache_control": _EPHEMERAL,
+    }
+
+
+def test_empty_string_tool_result_with_message_cache_control_becomes_the_placeholder():
+    from litellm.litellm_core_utils.prompt_templates.factory import convert_to_anthropic_tool_result
+
+    result = convert_to_anthropic_tool_result(_tool_message("", cache_control=_EPHEMERAL))
+
+    assert result == {
+        "type": "tool_result",
+        "tool_use_id": "toolu_empty_stdout",
+        "content": _EMPTY_TEXT_PLACEHOLDER,
+        "cache_control": _EPHEMERAL,
+    }
+
+
+def test_empty_string_tool_result_without_cache_control_is_left_as_is():
+    from litellm.litellm_core_utils.prompt_templates.factory import convert_to_anthropic_tool_result
+
+    result = convert_to_anthropic_tool_result(_tool_message(""))
+
+    assert result == {"type": "tool_result", "tool_use_id": "toolu_empty_stdout", "content": ""}
+
+
+def _all_text_blocks_in(value: object) -> list[dict[str, object]]:
+    if isinstance(value, list):
+        return [block for item in value for block in _all_text_blocks_in(item)]
+    if not isinstance(value, dict):
+        return []
+    nested: Final = _all_text_blocks_in(value.get("content"))
+    return [value, *nested] if value.get("type") == "text" else nested
+
+
+def test_vertex_claude_request_for_cursor_empty_tool_output_has_no_blank_text_block():
+    """The whole Cursor turn, rendered as Vertex/Anthropic messages, keeps its cache breakpoint
+    and has no blank text block anywhere for the provider to reject."""
+    messages: Final = [
+        {"role": "user", "content": "run the migration"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu_empty_stdout",
+                    "type": "function",
+                    "function": {"name": "run_terminal_cmd", "arguments": '{"command": "make migrate"}'},
+                }
+            ],
+        },
+        _tool_message([{"type": "text", "text": "", "cache_control": _EPHEMERAL}]),
+    ]
+
+    rendered: Final = anthropic_messages_pt(messages, model="claude-sonnet-4-5", llm_provider="vertex_ai")
+
+    text_blocks: Final = _all_text_blocks_in(rendered)
+    assert [block for block in text_blocks if not str(block.get("text", "")).strip()] == [], rendered
+    assert rendered[-1]["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_empty_stdout",
+            "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER, "cache_control": _EPHEMERAL}],
+        }
+    ]
+
+
 def test_convert_to_anthropic_tool_result_image_url_as_http():
     """
     Test that HTTP/HTTPS URLs with cache_control are handled correctly.
