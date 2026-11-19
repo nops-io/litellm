@@ -4133,6 +4133,49 @@ class TestHandleLLMApiExceptionPricesWhatTheServerDispatched:
 
 
 @pytest.mark.asyncio
+async def test_a_dispatched_provider_400_reaches_the_client_as_400_not_500() -> None:
+    """A provider rejection must pass through ``post_call_failure_hook`` with its own status.
+
+    Before the ``_failure_usage_to_lift`` signature fix the hook raised ``TypeError`` for every
+    dispatched failure, so Cursor saw a 500 (shown as "User Provided API Key Rate Limit
+    Exceeded") instead of Vertex's 400, and the failure never reached the spend log."""
+    processing_obj: Final = ProxyBaseLLMRequestProcessing(
+        data={"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "run the tests"}]}
+    )
+    caller: Final = ProxyUserAPIKeyAuth(request_route="/chat/completions")
+    mock_request: Final = MagicMock(spec=Request)
+    mock_request.headers = {}
+    proxy_logging: Final = ProxyLogging(user_api_key_cache=DualCache())
+    proxy_logging.alert_types = []
+    _, logging_obj = await processing_obj.common_processing_pre_call_logic(
+        request=mock_request,
+        general_settings={},
+        user_api_key_dict=caller,
+        proxy_logging_obj=proxy_logging,
+        proxy_config=MagicMock(spec=ProxyConfig),
+        route_type="acompletion",
+    )
+    logging_obj.model_call_details.update(first_api_call_start_time=datetime.datetime.now())
+    vertex_rejection: Final = litellm.BadRequestError(
+        message="cache_control cannot be set for empty text blocks",
+        model="claude-sonnet-4-5",
+        llm_provider="vertex_ai",
+    )
+
+    with pytest.raises(ProxyException) as raised:
+        await processing_obj.handle_llm_api_exception(
+            e=vertex_rejection,
+            user_api_key_dict=caller,
+            proxy_logging_obj=proxy_logging,
+        )
+
+    assert raised.value.code == "400", raised.value.message
+    assert "cache_control cannot be set for empty text blocks" in raised.value.message
+    assert processing_obj.data["call_type"] == "acompletion"
+    assert processing_obj.data["combined_usage_object"].completion_tokens == 0
+
+
+@pytest.mark.asyncio
 class TestHandleLLMApiExceptionDictDetail:
     """
     Coverage for `_handle_llm_api_exception` HTTPException branch (Site 2).

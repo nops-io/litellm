@@ -1702,6 +1702,40 @@ def _is_anthropic_document_data_uri(url: str) -> bool:
     return match.group(1) in _ANTHROPIC_DOCUMENT_BASE64_MEDIA_TYPES
 
 
+def _is_blank_text(text: object) -> bool:
+    return not isinstance(text, str) or not text.strip()
+
+
+_ToolResultContentBlock: TypeAlias = (
+    AnthropicMessagesToolResultContent | AnthropicMessagesImageParam | AnthropicMessagesDocumentParam | ToolReference
+)
+
+
+def _rehome_dropped_cache_control(
+    kept_blocks: list[_ToolResultContentBlock],
+    dropped_any: bool,
+    dropped_cache_control: ChatCompletionCachedContent | None,
+) -> tuple[list[_ToolResultContentBlock], ChatCompletionCachedContent | None]:
+    """Anthropic rejects blank text blocks inside a tool_result ("text content blocks must be
+    non-empty", "cache_control cannot be set for empty text blocks"), so the caller drops them.
+    Keep the client's cache breakpoint: on the last kept block, on a placeholder when nothing
+    is left, or else (returned) on the tool_result block itself."""
+    if not dropped_any:
+        return kept_blocks, None
+    if not kept_blocks:
+        placeholder: Final = AnthropicMessagesToolResultContent(type="text", text=_EMPTY_TEXT_PLACEHOLDER)
+        if dropped_cache_control is not None:
+            placeholder["cache_control"] = dropped_cache_control
+        return [placeholder], None
+    if dropped_cache_control is None:
+        return kept_blocks, None
+    last_block: Final = kept_blocks[-1]
+    if last_block["type"] == "tool_reference" or ("cache_control" in last_block and last_block["cache_control"]):
+        return kept_blocks, dropped_cache_control
+    last_block["cache_control"] = dropped_cache_control
+    return kept_blocks, None
+
+
 def convert_to_anthropic_tool_result(
     message: ChatCompletionToolMessage | ChatCompletionFunctionMessage,
     force_base64: bool = False,
@@ -1746,8 +1780,13 @@ def convert_to_anthropic_tool_result(
             | ToolReference
         ]
     ) = ""
+    # Cache breakpoint of a blank text block that was dropped and could not stay inside the content.
+    orphaned_cache_control: ChatCompletionCachedContent | None = None
     if isinstance(message["content"], str):
         anthropic_content = message["content"]
+        if message.get("cache_control") is not None and _is_blank_text(anthropic_content):
+            # A blank string becomes an empty text block upstream, which cannot carry cache_control.
+            anthropic_content = _EMPTY_TEXT_PLACEHOLDER
     elif isinstance(message["content"], list):
         content_list: Final = message["content"]
         anthropic_content_list: list[
@@ -1756,7 +1795,14 @@ def convert_to_anthropic_tool_result(
             | AnthropicMessagesDocumentParam
             | ToolReference
         ] = []
+        dropped_blank_text = False
+        dropped_cache_control: ChatCompletionCachedContent | None = None
         for content in content_list:
+            if content["type"] == "text" and _is_blank_text(content["text"]):
+                # e.g. Cursor sends {"type": "text", "text": "", "cache_control": ...} for a command with no output
+                dropped_blank_text = True
+                dropped_cache_control = content.get("cache_control") or dropped_cache_control
+                continue
             if content["type"] == "text":
                 # Only include cache_control if explicitly set and not None
                 # to avoid sending "cache_control": null which breaks some API channels
@@ -1808,10 +1854,12 @@ def convert_to_anthropic_tool_result(
                 )
                 anthropic_content_list.append(_file_block)
 
-        anthropic_content = anthropic_content_list
+        anthropic_content, orphaned_cache_control = _rehome_dropped_cache_control(
+            anthropic_content_list, dropped_blank_text, dropped_cache_control
+        )
     anthropic_tool_result: AnthropicMessagesToolResultParam | None = None
     ## PROMPT CACHING CHECK ##
-    cache_control: Final = message.get("cache_control", None)
+    cache_control: Final = message.get("cache_control", None) or orphaned_cache_control
     if message["role"] == "tool":
         tool_message: Final[ChatCompletionToolMessage] = message
         tool_call_id: str = tool_message["tool_call_id"]
